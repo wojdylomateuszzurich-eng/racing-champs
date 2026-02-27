@@ -1,694 +1,885 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// ─── Canvas Dimensions ───────────────────────────────────────────────────────
-const W = 720, H = 480;
-const ROAD_W = 76;
+/* ═══════════════════════════════════════════════════════════════════
+   ROAD RACER  –  full-screen, player names, persistent leaderboard
+═══════════════════════════════════════════════════════════════════ */
 
-// ─── Track: closed polyline (counter-clockwise) ──────────────────────────────
-const TRACK = [
-  [365, 455],  // 0  Start/Finish (bottom-centre)
-  [175, 448],  // 1
-  [80,  385],  // 2
-  [65,  270],  // 3  ← checkpoint 1
-  [80,  140],  // 4
-  [195,  62],  // 5
-  [365,  48],  // 6  ← checkpoint 2
-  [530,  62],  // 7
-  [640, 140],  // 8
-  [655, 270],  // 9  ← checkpoint 3
-  [640, 385],  // 10
-  [545, 448],  // 11
-  [365, 455],  // 12 (closes loop back to 0)
-];
+// ─── Internal canvas resolution (we CSS-scale this to fill screen) ────────────
+const CW = 480, CH = 700;
 
-const CP_INDICES = [3, 6, 9];  // waypoint indices that act as checkpoints
-const CP_RADIUS  = ROAD_W / 2 + 14;
-const FINISH_RADIUS = ROAD_W / 2 + 12;
+const ROAD_LEFT  = 70;
+const ROAD_RIGHT = 410;
+const ROAD_W     = ROAD_RIGHT - ROAD_LEFT;
+const NUM_LANES  = 4;
+const LANE_W     = ROAD_W / NUM_LANES;
+const GAME_SECS  = 45;
+const SCROLL_BASE = 4.5;
+const LS_KEY     = "roadracer_leaderboard_v1";
 
-// ─── Physics constants ────────────────────────────────────────────────────────
-const ACCEL    = 0.14;
-const BRAKE    = 0.22;
-const FRICTION = 0.955;
-const MAX_SPD  = 4.6;
-const TURN_K   = 0.052;
+const C = {
+  p1:"#FF3B30", p2:"#007AFF",
+  road:"#3a3a3a", roadEdge:"#1a1a1a",
+  grass:"#3aab3a", sky:"#87CEEB",
+  gold:"#FFD700", boost:"#00E5FF",
+};
 
-// ─── Color palette ────────────────────────────────────────────────────────────
-const P1_COLOR = "#FF3B30";
-const P2_COLOR = "#007AFF";
-
-// ─── Geometry helpers ─────────────────────────────────────────────────────────
-function distToSeg(px, py, ax, ay, bx, by) {
-  const dx = bx - ax, dy = by - ay;
-  const l2 = dx * dx + dy * dy;
-  if (l2 === 0) return Math.hypot(px - ax, py - ay);
-  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / l2));
-  return Math.hypot(px - ax - t * dx, py - ay - t * dy);
+// ─── Leaderboard helpers ──────────────────────────────────────────────────────
+function loadBoard() {
+  try { return JSON.parse(localStorage.getItem(LS_KEY) || "[]"); } catch { return []; }
+}
+function saveBoard(board) {
+  localStorage.setItem(LS_KEY, JSON.stringify(board));
+}
+function addScore(name, coins) {
+  const board = loadBoard();
+  board.push({ name: name || "Anonymous", coins, date: new Date().toLocaleDateString() });
+  board.sort((a, b) => b.coins - a.coins);
+  const top10 = board.slice(0, 10);
+  saveBoard(top10);
+  return top10;
 }
 
-function isOnRoad(x, y) {
-  for (let i = 0; i < TRACK.length - 1; i++) {
-    const [ax, ay] = TRACK[i], [bx, by] = TRACK[i + 1];
-    if (distToSeg(x, y, ax, ay, bx, by) < ROAD_W / 2) return true;
-  }
-  return false;
+// ─── Lane helpers ─────────────────────────────────────────────────────────────
+function laneX(lane) { return ROAD_LEFT + lane * LANE_W + LANE_W / 2; }
+
+// ─── Object factories ──────────────────────────────────────────────────────────
+const TRAFFIC_COLORS = ["#e74c3c","#3498db","#2ecc71","#f39c12","#9b59b6","#1abc9c","#e67e22"];
+
+function mkTraffic(spd) {
+  return { type:"traffic", x:laneX(Math.floor(Math.random()*NUM_LANES)), y:-70,
+    w:36, h:60, speed:spd*(0.6+Math.random()*0.8),
+    color:TRAFFIC_COLORS[Math.floor(Math.random()*TRAFFIC_COLORS.length)], id:Math.random() };
 }
-
-// ─── Drawing helpers ──────────────────────────────────────────────────────────
-function drawTrack(ctx) {
-  // 1. Grass background with texture dots
-  ctx.fillStyle = "#3aab3a";
-  ctx.fillRect(0, 0, W, H);
-
-  // Subtle grass texture
-  const grassDots = [
-    [100,60],[200,80],[450,70],[600,55],[660,180],[660,400],
-    [540,430],[200,430],[60,400],[60,150],[300,260],[430,260],
-    [365,160],[220,330],[510,330],[150,200],[580,200],
+function mkCoin(spd) {
+  return { type:"coin", x:laneX(Math.floor(Math.random()*NUM_LANES)), y:-20,
+    r:13, speed:spd*0.5, id:Math.random(), wobble:Math.random()*Math.PI*2 };
+}
+function mkOil(spd) {
+  return { type:"oil", x:laneX(Math.floor(Math.random()*NUM_LANES)), y:-35,
+    w:54, h:32, speed:spd*0.5, id:Math.random() };
+}
+function mkCones(spd) {
+  const sl = Math.floor(Math.random()*(NUM_LANES-1));
+  return [
+    { type:"cone", x:laneX(sl),   y:-35, w:22, h:36, speed:spd*0.5, id:Math.random() },
+    { type:"cone", x:laneX(sl+1), y:-35, w:22, h:36, speed:spd*0.5, id:Math.random()+1 },
   ];
-  ctx.fillStyle = "rgba(40,140,40,0.5)";
-  grassDots.forEach(([x,y]) => {
-    ctx.beginPath(); ctx.arc(x, y, 10, 0, Math.PI * 2); ctx.fill();
-  });
-
-  // 2. Road border (dark outer edge)
-  ctx.save();
-  ctx.beginPath();
-  TRACK.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
-  ctx.strokeStyle = "#888";
-  ctx.lineWidth = ROAD_W + 10;
-  ctx.lineJoin = "round";
-  ctx.lineCap  = "round";
-  ctx.stroke();
-
-  // 3. Road fill
-  ctx.beginPath();
-  TRACK.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
-  ctx.strokeStyle = "#4a4a4a";
-  ctx.lineWidth = ROAD_W;
-  ctx.stroke();
-
-  // 4. Road kerb / white edge lines
-  ctx.beginPath();
-  TRACK.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
-  ctx.strokeStyle = "rgba(255,255,255,0.75)";
-  ctx.lineWidth = ROAD_W - 8;
-  ctx.stroke();
-
-  // 5. Road inner fill (covers white, leaving edge stripe)
-  ctx.beginPath();
-  TRACK.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
-  ctx.strokeStyle = "#555";
-  ctx.lineWidth = ROAD_W - 18;
-  ctx.stroke();
-
-  // 6. Centre dashed yellow line
-  ctx.setLineDash([20, 18]);
-  ctx.beginPath();
-  TRACK.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
-  ctx.strokeStyle = "rgba(255,220,50,0.45)";
-  ctx.lineWidth = 2.5;
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.restore();
-
-  // 7. Start / finish checkered flag line
-  const [sx, sy] = TRACK[0];
-  const [nx, ny] = TRACK[1];
-  const ang = Math.atan2(ny - sy, nx - sx) + Math.PI / 2;
-  ctx.save();
-  ctx.translate(sx, sy);
-  ctx.rotate(ang);
-  const SQ = 7, COLS = 5, ROWS = 6;
-  for (let r = -ROWS / 2; r < ROWS / 2; r++) {
-    for (let c = -COLS / 2; c < COLS / 2; c++) {
-      ctx.fillStyle = (Math.floor(r + c)) % 2 === 0 ? "#fff" : "#000";
-      ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
-    }
-  }
-  ctx.restore();
-
-  // 8. Decorative trees (only off-road positions)
-  const trees = [
-    [365, 260], [220, 200], [510, 200], [365, 150],
-    [160, 320], [570, 320], [260, 100], [470, 100],
-  ];
-  trees.forEach(([tx, ty]) => {
-    if (isOnRoad(tx, ty)) return;
-    // Shadow
-    ctx.save();
-    ctx.fillStyle = "rgba(0,0,0,0.15)";
-    ctx.beginPath(); ctx.ellipse(tx + 4, ty + 8, 14, 8, 0, 0, Math.PI * 2); ctx.fill();
-    // Trunk
-    ctx.fillStyle = "#6b3f1e";
-    ctx.fillRect(tx - 3, ty, 6, 10);
-    // Canopy layers
-    ctx.fillStyle = "#2d7a2d";
-    ctx.beginPath(); ctx.arc(tx, ty, 18, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = "#3d9e3d";
-    ctx.beginPath(); ctx.arc(tx - 3, ty - 5, 13, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = "#4ec44e";
-    ctx.beginPath(); ctx.arc(tx + 2, ty - 8, 10, 0, Math.PI * 2); ctx.fill();
-    ctx.restore();
-  });
+}
+function mkBoost(spd) {
+  return { type:"boost", x:laneX(Math.floor(Math.random()*NUM_LANES)), y:-20,
+    r:18, speed:spd*0.5, id:Math.random() };
 }
 
-function drawCar(ctx, x, y, angle, color) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(angle + Math.PI / 2);
+// ─── Darken colour ────────────────────────────────────────────────────────────
+function dk(hex, amt) {
+  const n = parseInt(hex.replace("#",""),16);
+  return `rgb(${Math.max(0,(n>>16)-amt)},${Math.max(0,((n>>8)&255)-amt)},${Math.max(0,(n&255)-amt)})`;
+}
 
-  // Drop shadow
-  ctx.fillStyle = "rgba(0,0,0,0.25)";
-  ctx.beginPath();
-  ctx.ellipse(3, 4, 11, 17, 0, 0, Math.PI * 2);
-  ctx.fill();
+// ─── Canvas draw helpers ──────────────────────────────────────────────────────
+function drawRoad(ctx, offset) {
+  // sky
+  ctx.fillStyle = C.sky;
+  ctx.fillRect(0, 0, CW, CH*0.15);
+  // grass
+  ctx.fillStyle = C.grass;
+  ctx.fillRect(0, CH*0.15, CW, CH);
+  // road body
+  ctx.fillStyle = C.road;
+  ctx.fillRect(ROAD_LEFT, 0, ROAD_W, CH);
+  // kerb stripes (red/white) on edges
+  for (let y = (offset % 60) - 60; y < CH; y += 60) {
+    const c1 = Math.floor(y / 30) % 2 === 0 ? "#cc0000" : "#fff";
+    ctx.fillStyle = c1;
+    ctx.fillRect(ROAD_LEFT - 10, y, 10, 30);
+    ctx.fillRect(ROAD_RIGHT,     y, 10, 30);
+  }
+  // road edges
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(ROAD_LEFT,     0, 4, CH);
+  ctx.fillRect(ROAD_RIGHT-4,  0, 4, CH);
+  // dashed lane dividers
+  const dH = 40, gH = 30, tot = dH + gH;
+  ctx.fillStyle = "rgba(255,255,255,0.32)";
+  for (let lane = 1; lane < NUM_LANES; lane++) {
+    const lx = ROAD_LEFT + lane * LANE_W;
+    for (let y = (offset % tot) - tot; y < CH + tot; y += tot)
+      ctx.fillRect(lx - 2, y, 4, dH);
+  }
+  // horizon fade
+  const g = ctx.createLinearGradient(0,0,0,CH*0.22);
+  g.addColorStop(0,"rgba(135,206,235,0.95)"); g.addColorStop(1,"rgba(135,206,235,0)");
+  ctx.fillStyle = g; ctx.fillRect(0,0,CW,CH*0.22);
+  // side trees (static; looks fine since road scrolls)
+  drawTree(ctx, 22,  90); drawTree(ctx, 432,130);
+  drawTree(ctx, 18, 290); drawTree(ctx, 438,310);
+  drawTree(ctx, 25, 520); drawTree(ctx, 438,530);
+}
+
+function drawTree(ctx, x, y) {
+  ctx.fillStyle="#5a3010"; ctx.fillRect(x-4,y,8,24);
+  ctx.fillStyle="#2d7a2d"; ctx.beginPath(); ctx.arc(x,y-2,19,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#3d9e3d"; ctx.beginPath(); ctx.arc(x-3,y-8,14,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#55cc55"; ctx.beginPath(); ctx.arc(x+2,y-13,10,0,Math.PI*2); ctx.fill();
+}
+
+function drawPlayerCar(ctx, x, y, color, spin) {
+  ctx.save(); ctx.translate(x,y); if (spin) ctx.rotate(spin);
+  ctx.fillStyle="rgba(0,0,0,0.2)";
+  ctx.beginPath(); ctx.ellipse(3,6,17,11,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=color; ctx.beginPath(); ctx.roundRect(-17,-30,34,56,6); ctx.fill();
+  ctx.fillStyle=dk(color,35); ctx.fillRect(-17,22,34,5);
+  ctx.fillStyle=dk(color,18); ctx.beginPath(); ctx.roundRect(-12,-22,24,32,5); ctx.fill();
+  ctx.fillStyle="rgba(160,230,255,0.92)"; ctx.beginPath(); ctx.roundRect(-10,-24,20,15,3); ctx.fill();
+  ctx.fillStyle="rgba(255,255,255,0.45)"; ctx.beginPath(); ctx.roundRect(-9,-23,9,7,2); ctx.fill();
+  ctx.fillStyle="rgba(160,230,255,0.75)"; ctx.beginPath(); ctx.roundRect(-8,12,16,11,2); ctx.fill();
+  ctx.fillStyle="#ffffa0";
+  ctx.beginPath(); ctx.roundRect(-14,-30,8,4,1); ctx.fill();
+  ctx.beginPath(); ctx.roundRect(6,-30,8,4,1); ctx.fill();
+  ctx.fillStyle="#ff4444";
+  ctx.beginPath(); ctx.roundRect(-14,26,7,4,1); ctx.fill();
+  ctx.beginPath(); ctx.roundRect(7,26,7,4,1); ctx.fill();
+  ctx.fillStyle="#111";
+  [[-22,-22,10,17],[12,-22,10,17],[-22,8,10,17],[12,8,10,17]].forEach(([wx,wy,ww,wh])=>{
+    ctx.beginPath(); ctx.roundRect(wx,wy,ww,wh,2); ctx.fill();
+    ctx.fillStyle="#555"; ctx.beginPath(); ctx.arc(wx+ww/2,wy+wh/2,3.5,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle="#111";
+  });
+  ctx.restore();
+}
+
+function drawHorse(ctx, x, y, spin, t) {
+  ctx.save(); ctx.translate(x, y); if (spin) ctx.rotate(spin);
+  const gallop = Math.sin((t||0)*12)*0.3;
+
+  // Shadow
+  ctx.fillStyle="rgba(0,0,0,0.22)";
+  ctx.beginPath(); ctx.ellipse(2,28,18,9,0,0,Math.PI*2); ctx.fill();
 
   // Body
-  ctx.fillStyle = color;
+  ctx.fillStyle="#c8863a";
+  ctx.beginPath(); ctx.ellipse(0,0,18,26,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#dfa055";
+  ctx.beginPath(); ctx.ellipse(0,4,11,16,0,0,Math.PI*2); ctx.fill();
+
+  // Neck
+  ctx.fillStyle="#c8863a";
   ctx.beginPath();
-  ctx.roundRect(-11, -17, 22, 34, 5);
-  ctx.fill();
+  ctx.moveTo(-8,-18); ctx.quadraticCurveTo(-14,-34,-6,-44);
+  ctx.quadraticCurveTo(4,-34,6,-18); ctx.closePath(); ctx.fill();
 
-  // Spoiler
-  ctx.fillStyle = darken(color, 30);
-  ctx.fillRect(-11, 14, 22, 4);
+  // Head
+  ctx.fillStyle="#b87530";
+  ctx.beginPath(); ctx.ellipse(-8,-50,10,13,-0.3,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#d4956e";
+  ctx.beginPath(); ctx.ellipse(-10,-42,6,4,-0.3,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#8b4513";
+  ctx.beginPath(); ctx.ellipse(-13,-41,2,1.5,0.2,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#111";
+  ctx.beginPath(); ctx.arc(-4,-53,3,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#fff";
+  ctx.beginPath(); ctx.arc(-3,-54,1,0,Math.PI*2); ctx.fill();
 
-  // Roof
-  ctx.fillStyle = darken(color, 20);
+  // Ear
+  ctx.fillStyle="#c8863a";
+  ctx.beginPath(); ctx.moveTo(-1,-60); ctx.lineTo(4,-68); ctx.lineTo(7,-60); ctx.closePath(); ctx.fill();
+  ctx.fillStyle="#e8a070";
+  ctx.beginPath(); ctx.moveTo(1,-61); ctx.lineTo(4,-66); ctx.lineTo(6,-61); ctx.closePath(); ctx.fill();
+
+  // Mane
+  ctx.strokeStyle="#5c2e00"; ctx.lineWidth=6; ctx.lineCap="round";
   ctx.beginPath();
-  ctx.roundRect(-7, -11, 14, 20, 4);
-  ctx.fill();
-
-  // Windshield
-  ctx.fillStyle = "rgba(160,225,255,0.92)";
-  ctx.beginPath();
-  ctx.roundRect(-6, -15, 12, 10, 3);
-  ctx.fill();
-  // Windshield glare
-  ctx.fillStyle = "rgba(255,255,255,0.5)";
-  ctx.beginPath();
-  ctx.roundRect(-5, -14, 5, 4, 2);
-  ctx.fill();
-
-  // Rear window
-  ctx.fillStyle = "rgba(160,225,255,0.75)";
-  ctx.beginPath();
-  ctx.roundRect(-5, 8, 10, 7, 2);
-  ctx.fill();
-
-  // Headlights
-  ctx.fillStyle = "#ffffa0";
-  ctx.beginPath(); ctx.roundRect(-9, -18, 5, 3, 1); ctx.fill();
-  ctx.beginPath(); ctx.roundRect(4,  -18, 5, 3, 1); ctx.fill();
-
-  // Tail lights
-  ctx.fillStyle = "#ff4444";
-  ctx.beginPath(); ctx.roundRect(-9, 17, 4, 3, 1); ctx.fill();
-  ctx.beginPath(); ctx.roundRect(5,  17, 4, 3, 1); ctx.fill();
-
-  // Wheels (4 corners)
-  ctx.fillStyle = "#1a1a1a";
-  const wheels = [[-15,-13,7,12],[ 8,-13,7,12],[-15, 5,7,12],[ 8, 5,7,12]];
-  wheels.forEach(([wx, wy, ww, wh]) => {
-    ctx.beginPath(); ctx.roundRect(wx, wy, ww, wh, 2); ctx.fill();
-    ctx.fillStyle = "#444";
-    ctx.beginPath(); ctx.arc(wx + ww/2, wy + wh/2, 2.5, 0, Math.PI*2); ctx.fill();
-    ctx.fillStyle = "#1a1a1a";
-  });
-
-  ctx.restore();
-}
-
-function darken(hex, amount) {
-  const n = parseInt(hex.slice(1), 16);
-  const r = Math.max(0, (n >> 16) - amount);
-  const g = Math.max(0, ((n >> 8) & 0xff) - amount);
-  const b = Math.max(0, (n & 0xff) - amount);
-  return `rgb(${r},${g},${b})`;
-}
-
-function drawCheckpoints(ctx, cpIdx) {
-  CP_INDICES.forEach((wpIdx, i) => {
-    const [cx, cy] = TRACK[wpIdx];
-    const done = i < cpIdx;
-    ctx.save();
-    // Pulsing ring
-    ctx.globalAlpha = 0.85;
-    ctx.beginPath();
-    ctx.arc(cx, cy, 18, 0, Math.PI * 2);
-    ctx.fillStyle = done ? "rgba(50,220,80,0.55)" : "rgba(255,200,30,0.45)";
-    ctx.fill();
-    ctx.strokeStyle = done ? "#30ee60" : "#ffcc00";
-    ctx.lineWidth = 2.5;
-    ctx.stroke();
-    // Number
-    ctx.fillStyle = "#fff";
-    ctx.font = "bold 13px 'Comic Sans MS', cursive";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(done ? "✓" : `${i + 1}`, cx, cy);
-    ctx.restore();
-  });
-}
-
-function drawHUD(ctx, playerNum, elapsed, cpsDone, speed, offTrack) {
-  const color = playerNum === 1 ? P1_COLOR : P2_COLOR;
-  const label = playerNum === 1 ? "🚗 Player 1" : "🚙 Player 2";
-
-  ctx.save();
-  ctx.fillStyle = "rgba(10,10,30,0.72)";
-  ctx.beginPath();
-  ctx.roundRect(10, 10, 196, 85, 12);
-  ctx.fill();
-
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.roundRect(10, 10, 196, 85, 12);
+  ctx.moveTo(-2,-62); ctx.quadraticCurveTo(-12,-55,-10,-44);
+  ctx.quadraticCurveTo(-8,-38,-14,-30); ctx.quadraticCurveTo(-10,-24,-12,-18);
   ctx.stroke();
+  for (let i=0;i<5;i++){
+    ctx.fillStyle="#5c2e00";
+    ctx.beginPath(); ctx.ellipse(-9-i*1.5,-58+i*9,4,3,-0.5,0,Math.PI*2); ctx.fill();
+  }
 
-  ctx.fillStyle = color;
-  ctx.font = "bold 15px 'Comic Sans MS', cursive";
-  ctx.textAlign = "left";
-  ctx.textBaseline = "top";
-  ctx.fillText(label, 22, 20);
+  // Tail
+  ctx.strokeStyle="#5c2e00"; ctx.lineWidth=5; ctx.lineCap="round";
+  ctx.beginPath();
+  ctx.moveTo(10,14); ctx.quadraticCurveTo(26+gallop*8,22,22,38);
+  ctx.quadraticCurveTo(18,48,14+gallop*4,52); ctx.stroke();
+  ctx.lineWidth=3;
+  ctx.beginPath();
+  ctx.moveTo(10,14); ctx.quadraticCurveTo(30+gallop*10,26,26,42);
+  ctx.quadraticCurveTo(22,52,18+gallop*6,58); ctx.stroke();
 
-  ctx.fillStyle = "#fff";
-  ctx.font = "14px 'Comic Sans MS', cursive";
-  ctx.fillText(`⏱️  ${elapsed.toFixed(1)}s`, 22, 42);
-  ctx.fillText(`🏁  ${cpsDone}/${CP_INDICES.length} checkpoints`, 22, 62);
+  // Legs with gallop
+  const lc="#a06428";
+  function leg(bx,by,swing,front){
+    const a=front?swing:-swing;
+    ctx.save(); ctx.translate(bx,by);
+    ctx.strokeStyle=lc; ctx.lineWidth=7; ctx.lineCap="round";
+    const kx=Math.sin(a)*14, ky=14;
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(kx,ky); ctx.stroke();
+    const fx=kx+Math.sin(a*0.5)*8, fy=ky+14;
+    ctx.beginPath(); ctx.moveTo(kx,ky); ctx.lineTo(fx,fy); ctx.stroke();
+    ctx.fillStyle="#333";
+    ctx.beginPath(); ctx.ellipse(fx,fy+3,5,3,0,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+  leg(-10,14, gallop,      true);
+  leg(  6,14, gallop,      true);
+  leg(-10, 4,-gallop*0.8, false);
+  leg(  6, 4,-gallop*0.8, false);
 
-  // Speed bar
-  const barW = 172, barH = 8, barX = 22, barY = 82;
-  ctx.fillStyle = "rgba(255,255,255,0.15)";
-  ctx.beginPath(); ctx.roundRect(barX, barY, barW, barH, 4); ctx.fill();
-  const spd = Math.abs(speed) / MAX_SPD;
-  ctx.fillStyle = offTrack ? "#FF6B00" : "#30ee60";
-  ctx.beginPath(); ctx.roundRect(barX, barY, barW * spd, barH, 4); ctx.fill();
+  // Jockey
+  ctx.fillStyle="#007AFF";
+  ctx.beginPath(); ctx.ellipse(-4,-26,9,11,-0.15,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#FFDAB9";
+  ctx.beginPath(); ctx.arc(-6,-36,7,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#007AFF";
+  ctx.beginPath(); ctx.arc(-6,-39,7,Math.PI,2*Math.PI); ctx.fill();
+  ctx.fillStyle="#0055cc"; ctx.fillRect(-13,-40,14,3);
+  ctx.fillStyle="#111";
+  ctx.beginPath(); ctx.arc(-4,-36,1.5,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle="#FFDAB9"; ctx.lineWidth=2.5; ctx.lineCap="round";
+  ctx.beginPath(); ctx.moveTo(-1,-28); ctx.lineTo(6,-22+gallop*8); ctx.stroke();
+  ctx.strokeStyle="#8b4513"; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.moveTo(6,-22+gallop*8); ctx.lineTo(10,-10+gallop*12); ctx.stroke();
 
   ctx.restore();
 }
 
-// ─── Car factory ──────────────────────────────────────────────────────────────
-function makeCar(color) {
-  const startAngle = Math.atan2(TRACK[1][1] - TRACK[0][1], TRACK[1][0] - TRACK[0][0]);
+function drawTraffic(ctx, o) {
+  ctx.save(); ctx.translate(o.x,o.y); ctx.rotate(Math.PI);
+  ctx.fillStyle="rgba(0,0,0,0.18)";
+  ctx.beginPath(); ctx.ellipse(2,4,o.w/2-2,9,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=o.color; ctx.beginPath(); ctx.roundRect(-o.w/2,-o.h/2,o.w,o.h,5); ctx.fill();
+  ctx.fillStyle=dk(o.color,20); ctx.beginPath(); ctx.roundRect(-o.w/2+3,-o.h/2+5,o.w-6,o.h*0.55,4); ctx.fill();
+  ctx.fillStyle="rgba(160,230,255,0.85)"; ctx.beginPath(); ctx.roundRect(-o.w/2+4,-o.h/2+6,o.w-8,13,2); ctx.fill();
+  ctx.fillStyle="#ffffa0";
+  ctx.beginPath(); ctx.roundRect(-o.w/2+2,o.h/2-7,7,4,1); ctx.fill();
+  ctx.beginPath(); ctx.roundRect(o.w/2-9,o.h/2-7,7,4,1); ctx.fill();
+  ctx.fillStyle="#111";
+  [[-o.w/2-4,-o.h/2+2,8,13],[o.w/2-4,-o.h/2+2,8,13],
+   [-o.w/2-4,o.h/2-15,8,13],[o.w/2-4,o.h/2-15,8,13]].forEach(([wx,wy,ww,wh])=>{
+    ctx.beginPath(); ctx.roundRect(wx,wy,ww,wh,2); ctx.fill();
+  });
+  ctx.restore();
+}
+
+function drawCoin(ctx, o, t) {
+  const p = 1 + Math.sin(t*3+o.wobble)*0.09;
+  ctx.save(); ctx.translate(o.x,o.y); ctx.scale(p,p);
+  const g = ctx.createRadialGradient(0,0,0,0,0,o.r*2.2);
+  g.addColorStop(0,"rgba(255,215,0,0.55)"); g.addColorStop(1,"rgba(255,215,0,0)");
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(0,0,o.r*2.2,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#FFD700"; ctx.beginPath(); ctx.arc(0,0,o.r,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#FFA500"; ctx.beginPath(); ctx.arc(0,0,o.r-3,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#FFD700"; ctx.font=`bold ${o.r}px Arial`;
+  ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("★",0,1);
+  ctx.restore();
+}
+
+function drawOil(ctx, o) {
+  ctx.save(); ctx.translate(o.x,o.y);
+  ctx.fillStyle="rgba(25,25,25,0.88)";
+  ctx.beginPath(); ctx.ellipse(0,0,o.w/2,o.h/2,0,0,Math.PI*2); ctx.fill();
+  const g = ctx.createRadialGradient(-o.w/6,-o.h/6,1,0,0,o.w/2);
+  g.addColorStop(0,"rgba(255,50,50,0.35)"); g.addColorStop(0.33,"rgba(50,255,50,0.25)");
+  g.addColorStop(0.66,"rgba(50,50,255,0.25)"); g.addColorStop(1,"rgba(0,0,0,0)");
+  ctx.fillStyle=g; ctx.beginPath(); ctx.ellipse(0,0,o.w/2,o.h/2,0,0,Math.PI*2); ctx.fill();
+  ctx.font="18px Arial"; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("🛢️",0,0);
+  ctx.restore();
+}
+
+function drawCone(ctx, o) {
+  ctx.save(); ctx.translate(o.x,o.y);
+  ctx.fillStyle="#555"; ctx.fillRect(-o.w/2,o.h/4,o.w,o.h/4);
+  ctx.fillStyle="#FF6B00";
+  ctx.beginPath(); ctx.moveTo(0,-o.h/2); ctx.lineTo(o.w/2,o.h/4); ctx.lineTo(-o.w/2,o.h/4); ctx.closePath(); ctx.fill();
+  ctx.fillStyle="#fff";
+  ctx.beginPath(); ctx.moveTo(-o.w/4,-o.h/8); ctx.lineTo(o.w/4,-o.h/8);
+  ctx.lineTo(o.w/3,o.h/8); ctx.lineTo(-o.w/3,o.h/8); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawBoost(ctx, o, t) {
+  ctx.save(); ctx.translate(o.x,o.y); ctx.rotate(t*2);
+  const g = ctx.createRadialGradient(0,0,0,0,0,o.r*1.5);
+  g.addColorStop(0,"rgba(0,229,255,0.65)"); g.addColorStop(1,"rgba(0,229,255,0)");
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(0,0,o.r*1.5,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#00E5FF"; ctx.strokeStyle="#fff"; ctx.lineWidth=2.5;
+  ctx.beginPath();
+  ctx.moveTo(5,-14); ctx.lineTo(-3,0); ctx.lineTo(4,0); ctx.lineTo(-5,14);
+  ctx.lineTo(3,2); ctx.lineTo(-4,2); ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+function drawHUD(ctx, pName, pColor, timeLeft, coins, speed, boosted, oiled) {
+  // top bar
+  ctx.fillStyle="rgba(8,8,28,0.88)";
+  ctx.fillRect(0,0,CW,58);
+  ctx.strokeStyle=pColor; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(0,58); ctx.lineTo(CW,58); ctx.stroke();
+
+  // player name + car icon
+  ctx.fillStyle=pColor; ctx.font="bold 16px 'Fredoka One','Comic Sans MS',cursive";
+  ctx.textAlign="left"; ctx.textBaseline="middle";
+  ctx.fillText(`${pColor === C.p2 ? "🐴" : "🚗"} ${pName}`, 14, 20);
+
+  // star count  
+  ctx.fillStyle=C.gold; ctx.font="bold 22px 'Fredoka One','Comic Sans MS',cursive";
+  ctx.textAlign="center"; ctx.fillText(`★ ${coins}`, CW/2, 22);
+
+  // timer
+  const urgent = timeLeft < 10;
+  ctx.fillStyle = urgent ? "#FF3B30" : "#fff";
+  ctx.font=`bold ${urgent?19:16}px 'Fredoka One','Comic Sans MS',cursive`;
+  ctx.textAlign="right";
+  ctx.fillText(`⏱ ${timeLeft.toFixed(1)}s`, CW-14, 20);
+
+  // speed bar
+  const bx=14, by=42, bw=CW-28, bh=11;
+  ctx.fillStyle="rgba(255,255,255,0.1)";
+  ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,5); ctx.fill();
+  const pct = Math.min(1, Math.abs(speed)/11);
+  ctx.fillStyle = boosted?"#00E5FF": oiled?"#cc6600":"#30ee60";
+  ctx.beginPath(); ctx.roundRect(bx,by,bw*pct,bh,5); ctx.fill();
+
+  if (boosted) { ctx.fillStyle="#00E5FF"; ctx.font="bold 10px sans-serif"; ctx.textAlign="left"; ctx.fillText("⚡ BOOST",bx,57); }
+  if (oiled)   { ctx.fillStyle="#FF6B00"; ctx.font="bold 10px sans-serif"; ctx.textAlign="left"; ctx.fillText("🛢 SLIPPING",bx,57); }
+}
+
+// ─── Game state ───────────────────────────────────────────────────────────────
+function mkState(playerNum, name) {
   return {
-    x: TRACK[0][0] + 22,
-    y: TRACK[0][1],
-    angle: startAngle,
-    speed: 0,
-    color,
-    offTrack: false,
-    cpIdx: 0,
-    finished: false,
-    startTime: Date.now(),
+    playerNum, name, color: playerNum===1 ? C.p1 : C.p2,
+    x: ROAD_LEFT + ROAD_W/2, y: CH - 110,
+    speed: SCROLL_BASE, spinAngle:0,
+    oilTimer:0, boostTimer:0,
+    coins:0, objects:[], stripeOffset:0,
+    startTime: Date.now(), spawnTimer:0, distance:0,
+    alive:true, flashTimer:0, flashColor:"", popups:[],
   };
 }
 
-// ─── Main component ───────────────────────────────────────────────────────────
-export default function RacingChamps() {
-  const canvasRef   = useRef(null);
-  const gameRef     = useRef(null);   // { car, playerNum }
-  const keysRef     = useRef({});
-  const rafRef      = useRef(null);
+/* ══════════════════════════════════════════════════════════════════════════════
+   REACT COMPONENT
+══════════════════════════════════════════════════════════════════════════════ */
+export default function RoadRacer() {
+  const canvasRef  = useRef(null);
+  const stateRef   = useRef(null);
+  const keysRef    = useRef({});
+  const rafRef     = useRef(null);
+  const scaleRef   = useRef(1);
 
-  const [ui, setUi] = useState({
-    phase: "intro",   // intro | racing | done1 | results
-    p1Time: null,
-    p2Time: null,
-    elapsed: 0,
-    cpsDone: 0,
-    countdown: null,
-  });
+  // UI state
+  const [phase, setPhase]   = useState("names");  // names | racing | done1 | results | board
+  const [p1Name, setP1Name] = useState("");
+  const [p2Name, setP2Name] = useState("");
+  const [p1Coins, setP1Coins] = useState(0);
+  const [p2Coins, setP2Coins] = useState(0);
+  const [liveCoins, setLiveCoins] = useState(0);
+  const [liveTime,  setLiveTime]  = useState(GAME_SECS);
+  const [board, setBoard]   = useState([]);
+  const [canvasSize, setCanvasSize] = useState({ w: CW, h: CH });
 
-  // Key listeners
+  // ── Full-screen resize handler ──────────────────────────────────────────────
   useEffect(() => {
-    const dn = (e) => {
+    function resize() {
+      const scaleX = window.innerWidth  / CW;
+      const scaleY = window.innerHeight / CH;
+      const scale  = Math.min(scaleX, scaleY);
+      scaleRef.current = scale;
+      setCanvasSize({ w: CW * scale, h: CH * scale });
+    }
+    resize();
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
+  }, []);
+
+  // ── Key listeners ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    const dn = e => {
       keysRef.current[e.code] = true;
-      if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.code))
-        e.preventDefault();
+      if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.code)) e.preventDefault();
     };
-    const up = (e) => { keysRef.current[e.code] = false; };
+    const up = e => { keysRef.current[e.code] = false; };
     window.addEventListener("keydown", dn);
     window.addEventListener("keyup",   up);
-    return () => { window.removeEventListener("keydown", dn); window.removeEventListener("keyup", up); };
+    return () => { window.removeEventListener("keydown",dn); window.removeEventListener("keyup",up); };
   }, []);
 
-  // Start a player's race
+  // ── Load board on mount ─────────────────────────────────────────────────────
+  useEffect(() => { setBoard(loadBoard()); }, []);
+
+  // ── Start race ──────────────────────────────────────────────────────────────
   const startRace = useCallback((playerNum) => {
-    const color = playerNum === 1 ? P1_COLOR : P2_COLOR;
-    gameRef.current = { car: makeCar(color), playerNum };
-    setUi(u => ({ ...u, phase: "racing", elapsed: 0, cpsDone: 0, countdown: null }));
-  }, []);
+    const name = playerNum===1 ? (p1Name.trim()||"Player 1") : (p2Name.trim()||"Player 2");
+    stateRef.current = mkState(playerNum, name);
+    setLiveCoins(0); setLiveTime(GAME_SECS);
+    setPhase("racing");
+  }, [p1Name, p2Name]);
 
-  // Game loop
+  // ── Game loop ───────────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-    let lastElapsedUpdate = 0;
+    const ctx    = canvas.getContext("2d");
+    let last = 0;
 
-    const loop = (ts) => {
+    const loop = ts => {
       rafRef.current = requestAnimationFrame(loop);
+      const dt = Math.min((ts-last)/1000, 0.05); last = ts;
+      const t  = ts/1000;
+      const s  = stateRef.current;
 
-      // ── Draw static track ───────────────────────────────────────────────────
-      drawTrack(ctx);
+      drawRoad(ctx, s ? s.stripeOffset : 0);
 
-      const g = gameRef.current;
-
-      if (g) {
-        const { car, playerNum } = g;
-
-        // ── Physics update ────────────────────────────────────────────────────
-        if (!car.finished) {
-          const k = keysRef.current;
-          const turnFactor = Math.min(1, Math.abs(car.speed) / MAX_SPD * 1.8 + 0.25);
-
-          if (k["ArrowLeft"])  car.angle -= TURN_K * turnFactor;
-          if (k["ArrowRight"]) car.angle += TURN_K * turnFactor;
-
-          const offRoadMax = MAX_SPD * 0.45;
-          if (k["ArrowUp"])
-            car.speed = Math.min(car.speed + ACCEL, car.offTrack ? offRoadMax : MAX_SPD);
-          else if (k["ArrowDown"])
-            car.speed = Math.max(car.speed - BRAKE, -MAX_SPD * 0.35);
-          else
-            car.speed *= FRICTION;
-
-          if (Math.abs(car.speed) < 0.02) car.speed = 0;
-
-          car.offTrack = !isOnRoad(car.x, car.y);
-          if (car.offTrack) car.speed *= 0.87;
-
-          car.x = Math.max(8, Math.min(W - 8, car.x + Math.cos(car.angle) * car.speed));
-          car.y = Math.max(8, Math.min(H - 8, car.y + Math.sin(car.angle) * car.speed));
-
-          // ── Checkpoint detection ────────────────────────────────────────────
-          if (car.cpIdx < CP_INDICES.length) {
-            const [cx, cy] = TRACK[CP_INDICES[car.cpIdx]];
-            if (Math.hypot(car.x - cx, car.y - cy) < CP_RADIUS) {
-              car.cpIdx++;
-              setUi(u => ({ ...u, cpsDone: car.cpIdx }));
-            }
-          }
-
-          // ── Finish detection ────────────────────────────────────────────────
-          if (car.cpIdx >= CP_INDICES.length) {
-            const [fx, fy] = TRACK[0];
-            if (Math.hypot(car.x - fx, car.y - fy) < FINISH_RADIUS) {
-              car.finished = true;
-              const t = (Date.now() - car.startTime) / 1000;
-              if (playerNum === 1) {
-                setUi(u => ({ ...u, phase: "done1", p1Time: t }));
-              } else {
-                setUi(u => ({ ...u, phase: "results", p2Time: t }));
-              }
-            }
-          }
-
-          // ── Update timer display every 100ms ───────────────────────────────
-          if (ts - lastElapsedUpdate > 100) {
-            lastElapsedUpdate = ts;
-            setUi(u => ({ ...u, elapsed: (Date.now() - car.startTime) / 1000 }));
-          }
-        }
-
-        // ── Draw checkpoints ──────────────────────────────────────────────────
-        drawCheckpoints(ctx, car.cpIdx);
-
-        // ── Draw car ──────────────────────────────────────────────────────────
-        drawCar(ctx, car.x, car.y, car.angle, car.color);
-
-        // ── Off-track warning ─────────────────────────────────────────────────
-        if (car.offTrack && !car.finished) {
-          ctx.save();
-          ctx.strokeStyle = "rgba(255,100,0,0.55)";
-          ctx.lineWidth = 8;
-          ctx.strokeRect(0, 0, W, H);
-          ctx.fillStyle = "rgba(255,100,0,0.18)";
-          ctx.fillRect(0, 0, W, H);
-          ctx.fillStyle = "#FF6B00";
-          ctx.font = "bold 22px 'Comic Sans MS', cursive";
-          ctx.textAlign = "center";
-          ctx.textBaseline = "top";
-          ctx.fillText("🌿 Off road! Slow down!", W / 2, 12);
-          ctx.restore();
-        }
-
-        // ── HUD ───────────────────────────────────────────────────────────────
-        if (!car.finished) {
-          const elapsed = (Date.now() - car.startTime) / 1000;
-          drawHUD(ctx, playerNum, elapsed, car.cpIdx, car.speed, car.offTrack);
-        }
-
-        // ── Direction arrow at start (first few seconds) ──────────────────────
-        const elapsed = (Date.now() - car.startTime) / 1000;
-        if (elapsed < 4 && !car.finished) {
-          const [ax, ay] = TRACK[0];
-          const [bx, by] = TRACK[1];
-          const arrowAng = Math.atan2(by - ay, bx - ax);
-          ctx.save();
-          ctx.translate(ax + Math.cos(arrowAng) * 55, ay + Math.sin(arrowAng) * 55);
-          ctx.rotate(arrowAng);
-          ctx.globalAlpha = Math.max(0, 1 - elapsed / 4);
-          ctx.fillStyle = "#FFD700";
-          ctx.font = "bold 28px Arial";
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText("➤", 0, 0);
-          ctx.restore();
-        }
-      } else {
-        // No game active — show just the track
-        drawCheckpoints(ctx, 0);
+      if (!s || !s.alive) {
+        drawPlayerCar(ctx, ROAD_LEFT+ROAD_W/2, CH-110, C.p1, 0);
+        return;
       }
+
+
+      const k = keysRef.current;
+      const oiled   = s.oilTimer  > 0;
+      const boosted = s.boostTimer > 0;
+
+      // Physics
+      const tgtSpd = k["ArrowUp"]   ? (boosted?14:9)
+                   : k["ArrowDown"]  ? 2
+                   : SCROLL_BASE + s.distance/3000;
+      s.speed += (tgtSpd - s.speed) * 0.08;
+      s.speed  = Math.max(1.5, Math.min(boosted?14:10, s.speed));
+
+      const drift = oiled ? (Math.random()-0.5)*4 : 0;
+      const str   = oiled ? 6.5 : 5.5;
+      if (k["ArrowLeft"])  s.x -= str + drift;
+      if (k["ArrowRight"]) s.x += str + drift;
+      s.x = Math.max(ROAD_LEFT+22, Math.min(ROAD_RIGHT-22, s.x));
+
+      if (oiled) s.spinAngle += 0.2; else s.spinAngle *= 0.82;
+
+      if (s.oilTimer   > 0) s.oilTimer   = Math.max(0, s.oilTimer   - dt);
+      if (s.boostTimer > 0) s.boostTimer = Math.max(0, s.boostTimer - dt);
+      if (s.flashTimer > 0) s.flashTimer = Math.max(0, s.flashTimer - dt);
+
+      s.stripeOffset += s.speed;
+      s.distance     += s.speed;
+
+      // Time
+      s.timeLeft = Math.max(0, GAME_SECS - (Date.now()-s.startTime)/1000);
+      if (s.timeLeft <= 0) {
+        s.alive = false;
+        const { coins, playerNum, name } = s;
+        stateRef.current = null;
+        // Save score
+        const updated = addScore(name, coins);
+        setBoard(updated);
+        if (playerNum === 1) {
+          setP1Coins(coins);
+          setPhase("done1");
+        } else {
+          setP2Coins(coins);
+          setPhase("results");
+        }
+        return;
+      }
+      setLiveCoins(s.coins);
+      setLiveTime(s.timeLeft);
+
+      // Spawn
+      s.spawnTimer -= dt;
+      if (s.spawnTimer <= 0) {
+        const diff = 1 + s.distance/4000;
+        s.spawnTimer = Math.max(0.32, 1.1 - diff*0.09);
+        const r = Math.random();
+        if      (r < 0.30) s.objects.push(mkCoin(s.speed));
+        else if (r < 0.50) s.objects.push(mkTraffic(s.speed));
+        else if (r < 0.63) s.objects.push(mkOil(s.speed));
+        else if (r < 0.79) s.objects.push(...mkCones(s.speed));
+        else if (r < 0.89) s.objects.push(mkBoost(s.speed));
+        else               s.objects.push(mkCoin(s.speed), mkCoin(s.speed));
+      }
+
+      // Update objects
+      const alive = [];
+      for (const o of s.objects) {
+        o.y += o.speed + s.speed*0.7;
+        if (o.y > CH+90) continue;
+        const hit_x = Math.abs(s.x-o.x);
+        const hit_y = Math.abs(s.y-o.y);
+
+        if (o.type==="coin") {
+          if (Math.hypot(s.x-o.x,s.y-o.y) < o.r+15) {
+            s.coins++;
+            s.popups.push({text:"+1 ★",x:o.x,y:o.y,life:1,col:C.gold}); continue;
+          }
+          drawCoin(ctx,o,t);
+        } else if (o.type==="traffic") {
+          if (hit_x < o.w/2+15 && hit_y < o.h/2+18) {
+            s.flashTimer=0.45; s.flashColor="#FF3B30";
+            s.coins = Math.max(0, s.coins-2);
+            s.popups.push({text:"-2 ★",x:o.x,y:o.y,life:1,col:"#FF3B30"}); continue;
+          }
+          drawTraffic(ctx,o);
+        } else if (o.type==="oil") {
+          if (hit_x < o.w/2+12 && hit_y < o.h/2+12) {
+            s.oilTimer=2.8; s.flashTimer=0.3; s.flashColor="#8B4513";
+            s.popups.push({text:"🛢 Slipping!",x:o.x,y:o.y,life:1.3,col:"#FF6B00"}); continue;
+          }
+          drawOil(ctx,o);
+        } else if (o.type==="cone") {
+          if (hit_x < o.w/2+13 && hit_y < o.h/2+15) {
+            s.flashTimer=0.3; s.flashColor="#FF6B00";
+            s.coins = Math.max(0, s.coins-1);
+            s.popups.push({text:"-1 ★",x:o.x,y:o.y,life:1,col:"#FF6B00"}); continue;
+          }
+          drawCone(ctx,o);
+        } else if (o.type==="boost") {
+          if (Math.hypot(s.x-o.x,s.y-o.y) < o.r+15) {
+            s.boostTimer=3.2;
+            s.popups.push({text:"⚡ BOOST!",x:o.x,y:o.y,life:1.3,col:"#00E5FF"}); continue;
+          }
+          drawBoost(ctx,o,t);
+        }
+        alive.push(o);
+      }
+      s.objects = alive;
+
+      // Popups
+      s.popups = s.popups.filter(p=>p.life>0);
+      for (const p of s.popups) {
+        ctx.save(); ctx.globalAlpha=Math.min(1,p.life*2);
+        ctx.fillStyle=p.col; ctx.font="bold 20px 'Fredoka One','Comic Sans MS',cursive";
+        ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText(p.text,p.x,p.y);
+        ctx.restore(); p.y-=1.8; p.life-=dt*1.3;
+      }
+
+      if (s.playerNum === 2) {
+        drawHorse(ctx, s.x, s.y, s.spinAngle, t);
+      } else {
+        drawPlayerCar(ctx, s.x, s.y, s.color, s.spinAngle);
+      }
+
+      if (s.flashTimer>0) {
+        ctx.save(); ctx.globalAlpha=s.flashTimer*0.65;
+        ctx.fillStyle=s.flashColor; ctx.fillRect(0,58,CW,CH-58); ctx.restore();
+      }
+
+      drawHUD(ctx, s.name, s.color, s.timeLeft, s.coins, s.speed, boosted, oiled);
     };
 
     rafRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafRef.current);
   }, []);
 
-  // ── Results helpers ────────────────────────────────────────────────────────
-  const fmt = (t) => (t !== null ? `${t.toFixed(2)}s` : "—");
-  const getWinner = () => {
-    if (ui.p1Time === null || ui.p2Time === null) return null;
-    if (ui.p1Time < ui.p2Time) return 1;
-    if (ui.p2Time < ui.p1Time) return 2;
-    return 0;
+  // ── Derived ─────────────────────────────────────────────────────────────────
+  const currentP2Name = p2Name.trim() || "Player 2";
+  const currentP1Name = p1Name.trim() || "Player 1";
+  const winner = p1Coins > p2Coins ? 1 : p2Coins > p1Coins ? 2 : 0;
+
+  // Canvas style: scales to fill window while keeping aspect ratio
+  const canvasStyle = {
+    display:"block",
+    width:  canvasSize.w,
+    height: canvasSize.h,
+    imageRendering:"pixelated",
   };
-  const winner = getWinner();
 
   return (
-    <div style={styles.root}>
-      {/* Title */}
-      <div style={styles.titleRow}>
-        <span style={styles.titleEmoji}>🏎️</span>
-        <h1 style={styles.title}>Racing Champs!</h1>
-        <span style={styles.titleEmoji}>🏆</span>
-      </div>
+    <div style={S.root}>
+      {/* Always-present canvas */}
+      <canvas ref={canvasRef} width={CW} height={CH} style={canvasStyle} />
 
-      {/* Canvas wrapper */}
-      <div style={styles.canvasWrapper}>
-        <canvas ref={canvasRef} width={W} height={H} style={styles.canvas} />
+      {/* ── Name Entry ── */}
+      {phase==="names" && (
+        <FullOverlay>
+          <Modal>
+            <div style={{fontSize:54,marginBottom:4}}>🚗⭐🐴</div>
+            <h1 style={{color:C.gold,margin:"0 0 4px",fontSize:30,fontFamily:FF}}>Road Racer!</h1>
+            <p style={{color:"#bbb",fontSize:13,margin:"0 0 18px",fontFamily:FF}}>
+              Collect ★ stars in {GAME_SECS} seconds. Highest score wins!
+            </p>
 
-        {/* ── Intro overlay ────────────────────────────────────────────────── */}
-        {ui.phase === "intro" && (
-          <Overlay>
-            <Panel>
-              <div style={{ fontSize: 56, lineHeight: 1 }}>🏎️🏁🚙</div>
-              <h2 style={{ color: "#FFD700", margin: "10px 0 6px", fontSize: 28 }}>Racing Champs!</h2>
-              <p style={{ color: "#ddd", margin: "0 0 6px", fontSize: 15 }}>
-                Two players race around the track one at a time!
-              </p>
-              <div style={styles.controlsBox}>
-                <div style={styles.controlRow}><span style={styles.key}>⬆️</span><span>Go faster</span></div>
-                <div style={styles.controlRow}><span style={styles.key}>⬇️</span><span>Slow down / reverse</span></div>
-                <div style={styles.controlRow}><span style={styles.key}>⬅️ ➡️</span><span>Steer left & right</span></div>
+            <div style={S.nameRow}>
+              <div style={S.nameBlock}>
+                <label style={{...S.label,color:C.p1}}>🚗 Player 1 Name</label>
+                <input
+                  style={S.input}
+                  placeholder="Enter name…"
+                  maxLength={14}
+                  value={p1Name}
+                  onChange={e=>setP1Name(e.target.value)}
+                  onKeyDown={e=>e.stopPropagation()}
+                />
               </div>
-              <p style={{ color: "#bbb", margin: "10px 0 18px", fontSize: 14 }}>
-                🏁 Hit checkpoints <b style={{ color: "#FFD700" }}>1 → 2 → 3</b>, then cross the finish line!
-              </p>
-              <button onClick={() => startRace(1)} style={btnStyle(P1_COLOR)}>
-                🚗 Player 1 — Let's Go!
-              </button>
-            </Panel>
-          </Overlay>
-        )}
-
-        {/* ── Player 1 finished overlay ─────────────────────────────────────── */}
-        {ui.phase === "done1" && (
-          <Overlay>
-            <Panel>
-              <div style={{ fontSize: 52 }}>🎉</div>
-              <h2 style={{ color: P1_COLOR, margin: "8px 0 4px", fontSize: 26 }}>Player 1 Finished!</h2>
-              <p style={{ color: "#FFD700", fontSize: 30, margin: "4px 0 8px", fontWeight: "bold" }}>
-                ⏱️ {fmt(ui.p1Time)}
-              </p>
-              <p style={{ color: "#ddd", margin: "0 0 20px", fontSize: 15 }}>
-                Amazing race! Now it's Player 2's turn!
-              </p>
-              <button onClick={() => startRace(2)} style={btnStyle(P2_COLOR)}>
-                🚙 Player 2 — Your Turn!
-              </button>
-            </Panel>
-          </Overlay>
-        )}
-
-        {/* ── Results overlay ───────────────────────────────────────────────── */}
-        {ui.phase === "results" && (
-          <Overlay>
-            <Panel>
-              <div style={{ fontSize: 52 }}>
-                {winner === 0 ? "🤝" : "🏆"}
+              <div style={S.nameBlock}>
+                <label style={{...S.label,color:C.p2}}>🐴 Player 2 Name</label>
+                <input
+                  style={S.input}
+                  placeholder="Enter name…"
+                  maxLength={14}
+                  value={p2Name}
+                  onChange={e=>setP2Name(e.target.value)}
+                  onKeyDown={e=>e.stopPropagation()}
+                />
               </div>
-              <h2 style={{ color: "#FFD700", margin: "8px 0 4px", fontSize: 26 }}>
-                {winner === 0
-                  ? "It's a Tie! 🤯"
-                  : `Player ${winner} Wins! 🎊`}
-              </h2>
-              <div style={styles.resultsTimes}>
-                <div style={styles.resultRow}>
-                  <span style={{ color: P1_COLOR, fontSize: 20 }}>🚗 Player 1</span>
-                  <span style={{ color: "#fff", fontSize: 22, fontWeight: "bold" }}>{fmt(ui.p1Time)}</span>
-                  {winner === 1 && <span style={{ fontSize: 20 }}>⭐</span>}
-                </div>
-                <div style={styles.resultRow}>
-                  <span style={{ color: P2_COLOR, fontSize: 20 }}>🚙 Player 2</span>
-                  <span style={{ color: "#fff", fontSize: 22, fontWeight: "bold" }}>{fmt(ui.p2Time)}</span>
-                  {winner === 2 && <span style={{ fontSize: 20 }}>⭐</span>}
-                </div>
-              </div>
-              {winner !== 0 && ui.p1Time !== null && ui.p2Time !== null && (
-                <p style={{ color: "#aaa", fontSize: 14, margin: "4px 0 16px" }}>
-                  Difference: {Math.abs(ui.p1Time - ui.p2Time).toFixed(2)}s
-                </p>
-              )}
-              <button
-                onClick={() => {
-                  gameRef.current = null;
-                  setUi({ phase: "intro", p1Time: null, p2Time: null, elapsed: 0, cpsDone: 0, countdown: null });
-                }}
-                style={btnStyle("#22bb44")}
-              >
-                🔄 Play Again!
-              </button>
-            </Panel>
-          </Overlay>
-        )}
-      </div>
+            </div>
 
-      {/* Controls legend */}
-      <div style={styles.legend}>
-        <LegendKey icon="⬆️" label="Accelerate" />
-        <Sep />
-        <LegendKey icon="⬇️" label="Brake" />
-        <Sep />
-        <LegendKey icon="⬅️➡️" label="Steer" />
-        <Sep />
-        <span style={{ color: "#888" }}>Stay on the road! 🌿</span>
-      </div>
+            <div style={S.howToGrid}>
+              <HowTo icon="⬆️⬇️" text="Speed up / slow down" />
+              <HowTo icon="⬅️➡️" text="Steer between lanes" />
+              <HowTo icon="★"    text="Collect stars  +1" col={C.gold} />
+              <HowTo icon="⚡"   text="Grab boost pickups!" col="#00E5FF" />
+              <HowTo icon="🚗"   text="Dodge traffic  -2★" col="#FF3B30" />
+              <HowTo icon="🛢️"  text="Avoid oil slicks" col="#FF6B00" />
+              <HowTo icon="🚧"   text="Dodge cones  -1★" col="#FF6B00" />
+              <HowTo icon="🏆"   text="Most stars wins!" col={C.gold} />
+            </div>
+
+            <BtnRow>
+              <Btn color="#22bb44" onClick={()=>startRace(1)}>
+                🚗 {p1Name.trim()||"Player 1"} — Let's Go!
+              </Btn>
+              <Btn color="#555" onClick={()=>{ setBoard(loadBoard()); setPhase("board"); }}>
+                🏆 Leaderboard
+              </Btn>
+            </BtnRow>
+          </Modal>
+        </FullOverlay>
+      )}
+
+      {/* ── Player 1 done ── */}
+      {phase==="done1" && (
+        <FullOverlay>
+          <Modal>
+            <div style={{fontSize:56}}>🎉</div>
+            <h2 style={{color:C.p1,margin:"8px 0 2px",fontSize:26,fontFamily:FF}}>
+              {currentP1Name} finished!
+            </h2>
+            <p style={{color:C.gold,fontSize:42,margin:"4px 0",fontWeight:"bold",fontFamily:FF}}>
+              ★ {p1Coins}
+            </p>
+            <p style={{color:"#bbb",fontSize:14,margin:"0 0 20px",fontFamily:FF}}>
+              Can {currentP2Name} beat that?
+            </p>
+            <Btn color={C.p2} onClick={()=>startRace(2)}>
+              🐴 {currentP2Name} — Your Turn!
+            </Btn>
+          </Modal>
+        </FullOverlay>
+      )}
+
+      {/* ── Results ── */}
+      {phase==="results" && (
+        <FullOverlay>
+          <Modal wide>
+            <div style={{fontSize:52}}>{winner===0?"🤝":"🏆"}</div>
+            <h2 style={{color:C.gold,margin:"6px 0 14px",fontSize:26,fontFamily:FF}}>
+              {winner===0 ? "It's a Tie! 🤯"
+                : `${winner===1?currentP1Name:currentP2Name} Wins! 🎊`}
+            </h2>
+
+            {/* Score cards */}
+            <div style={S.scoreCards}>
+              <ScoreCard name={currentP1Name} coins={p1Coins} color={C.p1} won={winner===1} icon="🚗" />
+              <ScoreCard name={currentP2Name} coins={p2Coins} color={C.p2} won={winner===2} icon="🐴" />
+            </div>
+            {winner!==0 &&
+              <p style={{color:"#777",fontSize:12,margin:"4px 0 12px",fontFamily:FF}}>
+                Difference: {Math.abs(p1Coins-p2Coins)} star{Math.abs(p1Coins-p2Coins)!==1?"s":""}
+              </p>
+            }
+
+            {/* Mini leaderboard */}
+            <h3 style={{color:C.gold,margin:"10px 0 6px",fontSize:16,fontFamily:FF}}>🏆 Top 10</h3>
+            <MiniBoard board={board} highlight={[currentP1Name,currentP2Name]} />
+
+            <BtnRow>
+              <Btn color="#22bb44" onClick={()=>{
+                setP1Coins(0); setP2Coins(0);
+                setPhase("names");
+              }}>🔄 Play Again</Btn>
+              <Btn color="#555" onClick={()=>setPhase("board")}>📋 Full Board</Btn>
+            </BtnRow>
+          </Modal>
+        </FullOverlay>
+      )}
+
+      {/* ── Full leaderboard ── */}
+      {phase==="board" && (
+        <FullOverlay>
+          <Modal wide>
+            <h2 style={{color:C.gold,margin:"0 0 14px",fontSize:26,fontFamily:FF}}>
+              🏆 Top 10 Leaderboard
+            </h2>
+            <FullBoard board={board} />
+            <BtnRow>
+              <Btn color="#22bb44" onClick={()=>setPhase("names")}>🏎️ Play</Btn>
+              <Btn color="#cc2222" onClick={()=>{
+                if (window.confirm("Clear the entire leaderboard?")) {
+                  saveBoard([]);
+                  setBoard([]);
+                }
+              }}>🗑️ Clear</Btn>
+            </BtnRow>
+          </Modal>
+        </FullOverlay>
+      )}
     </div>
   );
 }
 
-// ── Small sub-components ──────────────────────────────────────────────────────
-function Overlay({ children }) {
+/* ── Font shorthand ──────────────────────────────────────────────────────────── */
+const FF = "'Fredoka One','Comic Sans MS','Chalkboard SE',cursive";
+
+/* ── Sub-components ─────────────────────────────────────────────────────────── */
+function FullOverlay({children}) {
   return (
     <div style={{
-      position: "absolute", inset: 0, display: "flex",
-      alignItems: "center", justifyContent: "center",
-      background: "rgba(0,0,0,0.72)", borderRadius: 14, zIndex: 20,
-    }}>
-      {children}
-    </div>
+      position:"fixed",inset:0,zIndex:50,
+      display:"flex",alignItems:"center",justifyContent:"center",
+      background:"rgba(4,4,20,0.88)",
+      backdropFilter:"blur(4px)",
+    }}>{children}</div>
   );
 }
 
-function Panel({ children }) {
+function Modal({children,wide}) {
   return (
     <div style={{
-      background: "linear-gradient(160deg, #0f0f2a, #1a1a3e)",
-      borderRadius: 18, padding: "28px 36px", textAlign: "center",
-      border: "2px solid #FFD700", boxShadow: "0 12px 48px rgba(0,0,0,0.8)",
-      maxWidth: 380, fontFamily: "'Comic Sans MS', 'Chalkboard SE', cursive",
+      background:"linear-gradient(160deg,#0d0d28,#181840)",
+      borderRadius:22,padding:"28px 32px",textAlign:"center",
+      border:"2.5px solid #FFD700",
+      boxShadow:"0 20px 60px rgba(0,0,0,0.9), 0 0 40px rgba(255,215,0,0.12)",
+      width: wide ? "min(94vw,520px)" : "min(92vw,400px)",
+      maxHeight:"92vh",overflowY:"auto",
+      fontFamily:FF,
+    }}>{children}</div>
+  );
+}
+
+function Btn({children,color,onClick}) {
+  return (
+    <button onClick={onClick} style={{
+      background:color,color:"#fff",border:"none",
+      padding:"12px 24px",borderRadius:11,fontSize:15,
+      fontWeight:"bold",cursor:"pointer",
+      boxShadow:`0 4px 18px ${color}88`,
+      fontFamily:FF,
+      transition:"transform .1s",
+    }}
+    onMouseEnter={e=>e.currentTarget.style.transform="scale(1.05)"}
+    onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}
+    >{children}</button>
+  );
+}
+
+function BtnRow({children}) {
+  return <div style={{display:"flex",gap:12,justifyContent:"center",marginTop:14,flexWrap:"wrap"}}>{children}</div>;
+}
+
+function HowTo({icon,text,col="#ccc"}) {
+  return (
+    <div style={{
+      display:"flex",alignItems:"center",gap:8,
+      background:"rgba(255,255,255,0.06)",borderRadius:8,
+      padding:"6px 10px",fontSize:12,color:col,
     }}>
-      {children}
+      <span style={{fontSize:16}}>{icon}</span>{text}
     </div>
   );
 }
 
-function LegendKey({ icon, label }) {
+function ScoreCard({name,coins,color,won,icon="🚗"}) {
   return (
-    <span style={{ color: "#bbb", fontSize: 13 }}>
-      <span style={{ marginRight: 4 }}>{icon}</span>{label}
-    </span>
+    <div style={{
+      flex:1,background:won?"rgba(255,215,0,0.1)":"rgba(255,255,255,0.05)",
+      border:`2px solid ${won?C.gold:color}`,borderRadius:12,
+      padding:"12px 10px",position:"relative",
+    }}>
+      {won && <div style={{position:"absolute",top:-12,left:"50%",transform:"translateX(-50%)",fontSize:22}}>🏆</div>}
+      <div style={{color,fontSize:15,fontWeight:"bold",fontFamily:FF,marginTop:won?8:0}}>{icon} {name}</div>
+      <div style={{color:C.gold,fontSize:30,fontWeight:"bold",fontFamily:FF}}>★ {coins}</div>
+    </div>
   );
 }
 
-function Sep() {
-  return <span style={{ color: "#444", margin: "0 10px" }}>|</span>;
+function MiniBoard({board,highlight}) {
+  if (!board.length) return <p style={{color:"#555",fontSize:13}}>No scores yet!</p>;
+  return (
+    <div style={{width:"100%",maxHeight:160,overflowY:"auto",marginBottom:4}}>
+      {board.map((e,i)=>{
+        const isHighlight = highlight.includes(e.name);
+        return (
+          <div key={i} style={{
+            display:"flex",justifyContent:"space-between",alignItems:"center",
+            padding:"5px 10px",borderRadius:8,marginBottom:3,
+            background: i===0 ? "rgba(255,215,0,0.15)" : isHighlight ? "rgba(0,229,255,0.1)" : "rgba(255,255,255,0.04)",
+            border: isHighlight ? "1px solid rgba(0,229,255,0.4)" : "1px solid transparent",
+          }}>
+            <span style={{color: i===0?"#FFD700": i===1?"#C0C0C0": i===2?"#CD7F32":"#888", fontSize:13, fontFamily:FF}}>
+              {i===0?"🥇":i===1?"🥈":i===2?"🥉":`#${i+1}`}
+            </span>
+            <span style={{color:"#ddd",fontSize:13,flex:1,textAlign:"left",marginLeft:10,fontFamily:FF}}>{e.name}</span>
+            <span style={{color:C.gold,fontWeight:"bold",fontSize:14,fontFamily:FF}}>★ {e.coins}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
-function btnStyle(bg) {
-  return {
-    background: bg, color: "#fff", border: "none",
-    padding: "13px 32px", borderRadius: 10, fontSize: 17,
-    fontWeight: "bold", cursor: "pointer",
-    boxShadow: `0 4px 16px ${bg}88`,
-    fontFamily: "'Comic Sans MS', 'Chalkboard SE', cursive",
-    transition: "transform 0.1s",
-  };
+function FullBoard({board}) {
+  if (!board.length) return (
+    <p style={{color:"#555",fontSize:14,fontFamily:FF,margin:"20px 0"}}>
+      No scores yet — play a game first!
+    </p>
+  );
+  return (
+    <div style={{width:"100%"}}>
+      <div style={{display:"grid",gridTemplateColumns:"40px 1fr 80px 90px",
+        gap:4,padding:"0 6px 8px",borderBottom:"1px solid rgba(255,215,0,0.2)"}}>
+        {["Rank","Name","Stars","Date"].map(h=>(
+          <span key={h} style={{color:"#FFD700",fontSize:12,fontWeight:"bold",fontFamily:FF,textAlign:h==="Stars"||h==="Rank"?"center":"left"}}>{h}</span>
+        ))}
+      </div>
+      {board.map((e,i)=>(
+        <div key={i} style={{
+          display:"grid",gridTemplateColumns:"40px 1fr 80px 90px",gap:4,
+          padding:"8px 6px",borderRadius:9,marginTop:4,
+          background: i===0?"rgba(255,215,0,0.14)": i===1?"rgba(192,192,192,0.08)": i===2?"rgba(205,127,50,0.08)":"rgba(255,255,255,0.04)",
+          border:`1px solid ${i<3?"rgba(255,215,0,0.2)":"transparent"}`,
+        }}>
+          <span style={{color: i===0?"#FFD700": i===1?"#C0C0C0": i===2?"#CD7F32":"#666",
+            textAlign:"center",fontSize:16,fontFamily:FF}}>
+            {i===0?"🥇":i===1?"🥈":i===2?"🥉":`${i+1}`}
+          </span>
+          <span style={{color:"#eee",fontSize:14,fontFamily:FF,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.name}</span>
+          <span style={{color:C.gold,fontWeight:"bold",fontSize:15,textAlign:"center",fontFamily:FF}}>★ {e.coins}</span>
+          <span style={{color:"#666",fontSize:11,textAlign:"right",fontFamily:FF,alignSelf:"center"}}>{e.date}</span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
-const styles = {
-  root: {
-    display: "flex", flexDirection: "column", alignItems: "center",
-    minHeight: "100vh", background: "linear-gradient(160deg, #0d0d1f 0%, #131330 60%, #1a1020 100%)",
-    padding: "18px 16px", fontFamily: "'Comic Sans MS', 'Chalkboard SE', cursive",
-    userSelect: "none",
+/* ── Styles ──────────────────────────────────────────────────────────────────── */
+const S = {
+  root:{
+    width:"100vw",height:"100vh",overflow:"hidden",
+    display:"flex",alignItems:"center",justifyContent:"center",
+    background:"#050510",
   },
-  titleRow: {
-    display: "flex", alignItems: "center", gap: 10, marginBottom: 12,
+  nameRow:{ display:"flex",gap:16,marginBottom:14,flexWrap:"wrap",justifyContent:"center" },
+  nameBlock:{ display:"flex",flexDirection:"column",gap:5,minWidth:150 },
+  label:{ fontSize:13,fontWeight:"bold",textAlign:"left",fontFamily:FF },
+  input:{
+    padding:"9px 13px",borderRadius:9,border:"2px solid rgba(255,255,255,0.2)",
+    background:"rgba(255,255,255,0.08)",color:"#fff",fontSize:15,
+    fontFamily:FF,outline:"none",
+    transition:"border-color .2s",
   },
-  titleEmoji: { fontSize: 36 },
-  title: {
-    color: "#FFD700", margin: 0, fontSize: 34,
-    textShadow: "0 3px 12px rgba(255,215,0,0.4), 0 1px 0 rgba(0,0,0,0.6)",
-    letterSpacing: 1,
+  howToGrid:{
+    display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,
+    margin:"0 0 16px",textAlign:"left",
   },
-  canvasWrapper: {
-    position: "relative",
-    boxShadow: "0 0 32px rgba(255,215,0,0.22), 0 8px 32px rgba(0,0,0,0.6)",
-    borderRadius: 14,
-    overflow: "hidden",
-  },
-  canvas: {
-    display: "block",
-    border: "3px solid #FFD700",
-    borderRadius: 14,
-  },
-  legend: {
-    marginTop: 12, display: "flex", alignItems: "center",
-    gap: 0, flexWrap: "wrap", justifyContent: "center",
-  },
-  controlsBox: {
-    background: "rgba(255,255,255,0.06)", borderRadius: 10,
-    padding: "10px 16px", margin: "10px auto", display: "inline-block",
-    textAlign: "left",
-  },
-  controlRow: {
-    display: "flex", alignItems: "center", gap: 10,
-    color: "#ddd", fontSize: 14, marginBottom: 4,
-  },
-  key: {
-    background: "rgba(255,255,255,0.12)", borderRadius: 6,
-    padding: "2px 7px", fontSize: 16, minWidth: 40, textAlign: "center",
-  },
-  resultsTimes: {
-    margin: "14px 0 6px", display: "flex", flexDirection: "column", gap: 10,
-  },
-  resultRow: {
-    display: "flex", alignItems: "center", justifyContent: "space-between",
-    gap: 16, background: "rgba(255,255,255,0.06)", borderRadius: 10, padding: "8px 14px",
-  },
+  scoreCards:{ display:"flex",gap:12,margin:"0 0 6px",justifyContent:"center" },
 };
